@@ -15,10 +15,10 @@ st.set_page_config(
     layout="wide",
 )
 
-# Critérios para consolidar os métodos em um único preço-teto
+# Critérios para consolidar os métodos. O primeiro é o padrão (conservador).
 CRITERIA = {
-    "Mediana dos métodos (equilibrado)": "median",
     "Menor valor (mais conservador)": "min",
+    "Mediana dos métodos": "median",
     "Média dos métodos": "mean",
 }
 
@@ -38,6 +38,16 @@ def init_db():
                 margin_safety REAL NOT NULL,
                 ceiling REAL NOT NULL,
                 methods_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                ticker TEXT PRIMARY KEY,
+                asset_type TEXT NOT NULL,
+                ceiling REAL NOT NULL,
+                last_price REAL NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
             )
         """)
         conn.commit()
@@ -79,11 +89,110 @@ def clear_history():
 
 
 # ---------------------------------------------------------------------
+# LISTA DE OBSERVAÇÃO
+# ---------------------------------------------------------------------
+def latest_analyses():
+    """Última análise salva de cada ticker."""
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT ticker, asset_type, market_price, ceiling FROM valuations
+            WHERE id IN (SELECT MAX(id) FROM valuations GROUP BY ticker)
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_watch(ticker, asset_type, ceiling, last_price, note=""):
+    """Insere ou atualiza um ativo. Observação vazia mantém a anterior."""
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            """
+            INSERT INTO watchlist (ticker, asset_type, ceiling, last_price, note, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                asset_type = excluded.asset_type,
+                ceiling = excluded.ceiling,
+                last_price = excluded.last_price,
+                note = CASE WHEN excluded.note = '' THEN watchlist.note ELSE excluded.note END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                ticker.upper().strip(),
+                asset_type,
+                ceiling,
+                last_price,
+                note.strip(),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        conn.commit()
+
+
+def get_watch(ticker):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM watchlist WHERE ticker = ?", (ticker.upper().strip(),)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def load_watchlist():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM watchlist").fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_watch(ticker):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker,))
+        conn.commit()
+
+
+def import_watch_from_history():
+    analyses = latest_analyses()
+    for item in analyses:
+        upsert_watch(item["ticker"], item["asset_type"], item["ceiling"], item["market_price"])
+    return len(analyses)
+
+
+def watch_status(price, ceiling):
+    if price <= 0:
+        return "⚪ Sem preço atual"
+    if price <= ceiling:
+        return "🟢 Dentro do teto"
+    if price <= ceiling * 1.05:
+        return "🟡 Até 5% acima do teto"
+    return "🔴 Acima do teto"
+
+
+def watch_distance(row):
+    """Folga até o teto: positivo = preço abaixo do teto. None se não há preço."""
+    if row["last_price"] <= 0:
+        return None
+    return row["ceiling"] / row["last_price"] - 1
+
+
+def days_since(timestamp):
+    try:
+        return (datetime.now() - datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")).days
+    except ValueError:
+        return 0
+
+
+# ---------------------------------------------------------------------
 # UTILIDADES
 # ---------------------------------------------------------------------
 def brl(value):
     # Formato brasileiro: R$ 1.000,00
     return f"R$ {value:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def num(value, decimals=2):
+    return f"{value:.{decimals}f}".replace(".", ",")
 
 
 def pct(value):
@@ -125,11 +234,47 @@ def discounted_cash_flow(base_flow, growth, rate, terminal_growth, years):
     return fair_value, discounted_terminal / fair_value
 
 
+def justified_pvp(roe, rate, growth):
+    """P/VP justo = (ROE - g) / (r - g). Retorna None se não for aplicável."""
+    if rate <= growth or roe <= growth:
+        return None
+    return (roe - growth) / (rate - growth)
+
+
+def multiple_flag(value, avg, maximum):
+    """🔴 acima do máximo histórico, 🟡 entre média e máximo, 🟢 até a média."""
+    if maximum > 0 and value > maximum:
+        return "🔴"
+    if avg > 0 and value > avg:
+        return "🟡"
+    if avg > 0 or maximum > 0:
+        return "🟢"
+    return ""
+
+
+def sanity_check(ceiling, eps, bvps, annual_dividend, hist):
+    """Múltiplos que o preço-teto pressupõe, comparados à história da própria empresa."""
+    result = {}
+    if eps > 0:
+        pl = ceiling / eps
+        result["P/L no teto"] = f"{num(pl, 1)} {multiple_flag(pl, hist['pl_avg'], hist['pl_max'])}".strip()
+    if bvps > 0:
+        pvp = ceiling / bvps
+        result["P/VP no teto"] = f"{num(pvp)} {multiple_flag(pvp, hist['pvp_avg'], hist['pvp_max'])}".strip()
+    if annual_dividend > 0:
+        dy = annual_dividend / ceiling * 100
+        flag = ""
+        if hist["dy_avg"] > 0:
+            flag = "🟡" if dy < hist["dy_avg"] else "🟢"
+        result["Yield no teto"] = f"{num(dy, 1)}% {flag}".strip()
+    return result
+
+
 # ---------------------------------------------------------------------
 # EXIBIÇÃO DOS RESULTADOS
 # ---------------------------------------------------------------------
 def show_results(asset_type, ticker, market_price, margin, methods,
-                 criterion_label, notes=None, indicators=None):
+                 criterion_label, notes=None, indicators=None, sanity=None):
     for note in notes or []:
         st.warning(note)
 
@@ -143,6 +288,7 @@ def show_results(asset_type, ticker, market_price, margin, methods,
     criterion_key = CRITERIA[criterion_label]
     ceiling = consolidate(methods, criterion_key)
     upside = ceiling / market_price - 1
+    values = [m["ceiling"] for m in methods]
 
     st.markdown(f"### Análise de {ticker.upper().strip()}")
 
@@ -167,22 +313,42 @@ def show_results(asset_type, ticker, market_price, margin, methods,
         for col, (label, value) in zip(cols, indicators):
             col.metric(label, value)
 
-    st.caption(f"Consolidação: {criterion_label}.")
-
-    st.dataframe(
-        [
-            {
-                "Método": item["name"],
-                "Valor justo / base": brl(item["fair_value"]),
-                "Margem aplicada": pct(item["margin_applied"]),
-                "Preço-teto": brl(item["ceiling"]),
-                "Premissa": item["assumption"],
-            }
-            for item in methods
-        ],
-        use_container_width=True,
-        hide_index=True,
+    st.caption(
+        f"Consolidação: {criterion_label}. Faixa entre os métodos: "
+        f"{brl(min(values))} (menor) · {brl(statistics.median(values))} (mediana) · "
+        f"{brl(max(values))} (maior)."
     )
+
+    if len(values) > 1 and max(values) / min(values) > 1.4:
+        st.warning(
+            f"Os métodos divergem bastante (o maior é {pct((max(values) / min(values) - 1) * 100)} "
+            "acima do menor). Isso quase sempre indica premissas incoerentes entre os métodos "
+            "(yield mínimo, taxa de desconto, múltiplos máximos). Revise antes de confiar no resultado."
+        )
+
+    rows = []
+    for item in methods:
+        row = {
+            "Método": item["name"],
+            "Valor justo / base": brl(item["fair_value"]),
+            "Margem aplicada": pct(item["margin_applied"]),
+            "Preço-teto": brl(item["ceiling"]),
+        }
+        if sanity:
+            row.update(sanity_check(item["ceiling"], sanity["eps"], sanity["bvps"],
+                                    sanity["dividend"], sanity["hist"]))
+        row["Premissa"] = item["assumption"]
+        rows.append(row)
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    if sanity and any(v > 0 for v in sanity["hist"].values()):
+        st.caption(
+            "Teste de sanidade: mostra o múltiplo que cada preço-teto pressupõe. "
+            "🟢 até a média histórica da empresa · 🟡 entre a média e o máximo · "
+            "🔴 acima do máximo histórico (pagaria mais do que o mercado já pagou). "
+            "No yield, 🟡 significa abaixo da média histórica (preço acima do normal)."
+        )
 
     save_valuation(asset_type, ticker, market_price, margin, ceiling, methods, criterion_label)
     st.info("💾 Análise salva no histórico.")
@@ -195,12 +361,13 @@ init_db()
 
 st.title("📊 Calculadora de Preço Teto (Valuation)")
 st.write(
-    "Métodos clássicos e consagrados (Bazin, Graham, Fluxo Descontado e P/VP) "
-    "para descobrir até que preço vale a pena começar a comprar uma ação ou FII."
+    "Métodos clássicos (Bazin, Graham, Fluxo Descontado, P/VP justo e P/VP alvo) "
+    "para descobrir até que preço vale a pena começar a comprar uma ação ou FII, "
+    "com um teste de sanidade contra os múltiplos históricos da própria empresa."
 )
 
-tab_stock, tab_fii, tab_history = st.tabs(
-    ["📈 Ações", "🏢 Fundos Imobiliários", "📂 Histórico"]
+tab_stock, tab_fii, tab_watch, tab_history = st.tabs(
+    ["📈 Ações", "🏢 Fundos Imobiliários", "👀 Lista de observação", "📂 Histórico"]
 )
 
 # ---------------------------------------------------------------------
@@ -222,8 +389,9 @@ with tab_stock:
             stock_ticker = st.text_input("Ticker (ex: BBAS3)")
             stock_price = st.number_input("Preço atual (R$)", min_value=0.0, step=0.10)
             stock_margin = st.number_input(
-                "Margem de segurança (%)", min_value=0.0, max_value=99.0, value=20.0, step=1.0,
-                help="Aplicada ao Fluxo Descontado, que é uma estimativa sujeita a erro de premissa.",
+                "Margem de segurança (%)", min_value=0.0, max_value=99.0, value=15.0, step=1.0,
+                help="Aplicada ao Fluxo Descontado e ao P/VP justo, que são estimativas "
+                     "sujeitas a erro de premissa.",
             )
             apply_all = st.checkbox(
                 "Aplicar a margem também a Bazin e Graham",
@@ -233,15 +401,25 @@ with tab_stock:
             )
             stock_criterion = st.selectbox("Como consolidar os métodos", list(CRITERIA.keys()))
 
+            st.markdown("**Referência histórica da empresa (opcional)**")
+            st.caption("Do histórico de indicadores do site, sem anos atípicos. Deixe 0 para ignorar.")
+            h_pl_avg = st.number_input("P/L médio histórico", min_value=0.0, step=0.5)
+            h_pl_max = st.number_input("P/L máximo histórico", min_value=0.0, step=0.5)
+            h_pvp_avg = st.number_input("P/VP médio histórico", min_value=0.0, step=0.05)
+            h_pvp_max = st.number_input("P/VP máximo histórico", min_value=0.0, step=0.05)
+            h_dy_avg = st.number_input("Yield médio histórico (%)", min_value=0.0, step=0.5)
+
         with col2:
             st.markdown("**Décio Bazin (Dividendos)**")
             dpa = st.number_input(
                 "DPA médio anual (R$)", min_value=0.0, step=0.10,
-                help="Ideal: média dos dividendos por ação dos últimos 5 anos.",
+                help="Ideal: média dos dividendos por ação dos últimos 5 anos, em reais.",
             )
             bazin_yield = st.number_input(
                 "Yield mínimo exigido (%)", min_value=0.1, value=6.0, step=0.5,
-                help="Bazin usa 6%. Em juros altos, considere exigir mais.",
+                help="Bazin usa 6%. Para ser coerente com o fluxo descontado, o yield mínimo "
+                     "deve ser parecido com o yield que o fluxo descontado equivale (aparece na "
+                     "coluna Premissa do resultado).",
             )
 
             st.markdown("**Número de Graham**")
@@ -252,6 +430,13 @@ with tab_stock:
             bvps = st.number_input("VPA — Valor patrimonial por ação (R$)", min_value=0.0, step=0.10)
             max_pl = st.number_input("P/L máximo", min_value=0.1, value=15.0, step=0.5)
             max_pvp = st.number_input("P/VP máximo", min_value=0.1, value=1.5, step=0.1)
+
+            st.markdown("**P/VP justo pelo ROE (ideal para bancos)**")
+            roe = st.number_input(
+                "ROE sustentável (%)", min_value=0.0, step=0.5,
+                help="Média de 3 a 5 anos. Usa a taxa de desconto e o crescimento na perpetuidade "
+                     "do bloco ao lado. Deixe 0 para ignorar.",
+            )
 
         with col3:
             st.markdown("**Fluxo de Caixa Descontado**")
@@ -282,6 +467,8 @@ with tab_stock:
             st.error("Informe um ticker e um preço atual maior que zero.")
         else:
             methods, notes = [], []
+            r, g, gt = discount_rate / 100, growth / 100, terminal_growth / 100
+            rate_ok = r > gt
 
             # 1. Bazin: preço máximo para receber o yield mínimo exigido
             if dpa > 0:
@@ -305,40 +492,66 @@ with tab_stock:
                 notes.append("Graham ignorado: informe LPA e VPA, ambos positivos.")
 
             # 3. Fluxo descontado (FCL ou dividendos)
-            if base_flow > 0:
-                r, g, gt = discount_rate / 100, growth / 100, terminal_growth / 100
-                if r <= gt:
+            if (base_flow > 0 or roe > 0) and not rate_ok:
+                notes.append(
+                    "Fluxo descontado e P/VP justo ignorados: a taxa de desconto precisa ser "
+                    "maior que o crescimento na perpetuidade."
+                )
+            if base_flow > 0 and rate_ok:
+                fair_value, terminal_share = discounted_cash_flow(base_flow, g, r, gt, int(years))
+                is_ddm = flow_type.startswith("Dividendos")
+                label = "DDM (Dividendos descontados)" if is_ddm else "FCD (Fluxo de Caixa Descontado)"
+                methods.append(make_method(
+                    label,
+                    fair_value,
+                    f"Fluxo cresce {growth:.1f}% a.a. por {int(years)} anos, depois "
+                    f"{terminal_growth:.1f}% na perpetuidade; desconto de {discount_rate:.1f}%. "
+                    f"Equivale a exigir yield de {pct(base_flow / fair_value * 100)} "
+                    f"sobre o fluxo atual (antes da margem).",
+                    stock_margin, True,
+                ))
+                if terminal_share > 0.75:
                     notes.append(
-                        "Fluxo descontado ignorado: a taxa de desconto precisa ser maior "
-                        "que o crescimento na perpetuidade."
+                        f"{terminal_share:.0%} do valor do fluxo descontado vem da perpetuidade. "
+                        "O resultado é muito sensível às premissas; considere aumentar os anos "
+                        "de projeção ou revisar as taxas."
                     )
-                else:
-                    fair_value, terminal_share = discounted_cash_flow(
-                        base_flow, g, r, gt, int(years)
-                    )
-                    label = "DDM (Dividendos descontados)" if flow_type.startswith("Dividendos") else "FCD (Fluxo de Caixa Descontado)"
-                    methods.append(make_method(
-                        label,
-                        fair_value,
-                        f"Fluxo cresce {growth:.1f}% a.a. por {int(years)} anos, "
-                        f"depois {terminal_growth:.1f}% na perpetuidade; desconto de {discount_rate:.1f}%.",
-                        stock_margin, True,
-                    ))
-                    if terminal_share > 0.75:
-                        notes.append(
-                            f"{terminal_share:.0%} do valor do fluxo descontado vem da perpetuidade. "
-                            "O resultado é muito sensível às premissas; considere aumentar os anos "
-                            "de projeção ou revisar as taxas."
-                        )
-                    if terminal_growth > 5:
-                        notes.append("Crescimento na perpetuidade acima de 5% é agressivo.")
+                if terminal_growth > 5:
+                    notes.append("Crescimento na perpetuidade acima de 5% é agressivo.")
 
-            indicators = [("P/L atual", f"{stock_price / eps:.1f}".replace(".", ",") if eps > 0 else "—"),
-                          ("P/VP atual", f"{stock_price / bvps:.2f}".replace(".", ",") if bvps > 0 else "—"),
-                          ("Dividend Yield", pct(dpa / stock_price * 100) if dpa > 0 else "—")]
+            # 4. P/VP justo pelo ROE (principal método para bancos)
+            if roe > 0 and rate_ok:
+                if bvps <= 0:
+                    notes.append("P/VP justo ignorado: informe o VPA.")
+                else:
+                    fair_pvp = justified_pvp(roe / 100, r, gt)
+                    if fair_pvp is None:
+                        notes.append(
+                            "P/VP justo ignorado: o ROE precisa ser maior que o crescimento "
+                            "na perpetuidade."
+                        )
+                    else:
+                        methods.append(make_method(
+                            "P/VP justo pelo ROE",
+                            bvps * fair_pvp,
+                            f"P/VP justo = (ROE {roe:.1f}% − {terminal_growth:.1f}%) ÷ "
+                            f"({discount_rate:.1f}% − {terminal_growth:.1f}%) = {num(fair_pvp)}x.",
+                            stock_margin, True,
+                        ))
+
+            indicators = [
+                ("P/L atual", num(stock_price / eps, 1) if eps > 0 else "—"),
+                ("P/VP atual", num(stock_price / bvps) if bvps > 0 else "—"),
+                ("Yield s/ DPA informado", pct(dpa / stock_price * 100) if dpa > 0 else "—"),
+            ]
+            sanity = {
+                "eps": eps, "bvps": bvps, "dividend": dpa,
+                "hist": {"pl_avg": h_pl_avg, "pl_max": h_pl_max, "pvp_avg": h_pvp_avg,
+                         "pvp_max": h_pvp_max, "dy_avg": h_dy_avg},
+            }
 
             show_results("Ação", stock_ticker, stock_price, stock_margin, methods,
-                         stock_criterion, notes, indicators)
+                         stock_criterion, notes, indicators, sanity)
 
 # ---------------------------------------------------------------------
 # FUNDOS IMOBILIÁRIOS
@@ -366,6 +579,11 @@ with tab_fii:
                 "Dividend Yield exigido (% ao ano)", min_value=0.1, value=9.0, step=0.5,
                 help="Sugestão: rendimento de um título longo (ex.: NTN-B) + prêmio de risco pelo FII.",
             )
+
+            st.markdown("**Referência histórica do fundo (opcional)**")
+            fh_pvp_avg = st.number_input("P/VP médio histórico", min_value=0.0, step=0.05, key="fh_pvp_avg")
+            fh_pvp_max = st.number_input("P/VP máximo histórico", min_value=0.0, step=0.05, key="fh_pvp_max")
+            fh_dy_avg = st.number_input("Yield médio histórico (%)", min_value=0.0, step=0.5, key="fh_dy_avg")
 
         with col2:
             st.markdown("**Método patrimonial (P/VP)**")
@@ -405,14 +623,110 @@ with tab_fii:
                 ))
 
             indicators = [
-                ("Dividend Yield atual",
+                ("Yield atual (rendimento informado)",
                  pct(monthly_distribution * 12 / fii_price * 100) if monthly_distribution > 0 else "—"),
-                ("P/VP atual",
-                 f"{fii_price / nav_per_share:.2f}".replace(".", ",") if nav_per_share > 0 else "—"),
+                ("P/VP atual", num(fii_price / nav_per_share) if nav_per_share > 0 else "—"),
             ]
+            sanity = {
+                "eps": 0.0, "bvps": nav_per_share, "dividend": monthly_distribution * 12,
+                "hist": {"pl_avg": 0.0, "pl_max": 0.0, "pvp_avg": fh_pvp_avg,
+                         "pvp_max": fh_pvp_max, "dy_avg": fh_dy_avg},
+            }
 
             show_results("FII", fii_ticker, fii_price, fii_margin, methods,
-                         fii_criterion, indicators=indicators)
+                         fii_criterion, indicators=indicators, sanity=sanity)
+
+# ---------------------------------------------------------------------
+# LISTA DE OBSERVAÇÃO
+# ---------------------------------------------------------------------
+with tab_watch:
+    st.subheader("Lista de observação")
+    st.caption(
+        "Guarde o preço-teto de cada ativo que você acompanha e atualize o preço atual quando "
+        "quiser conferir. Cadastre também um alerta de preço na corretora no valor do preço-teto. "
+        "Ativos com mais de 90 dias sem atualização aparecem marcados para revisão, "
+        "porque os dados mudam a cada divulgação de resultado."
+    )
+
+    with st.form("watch_form", clear_on_submit=True):
+        w1, w2, w3, w4 = st.columns(4)
+        w_ticker = w1.text_input("Ticker")
+        w_type = w2.selectbox("Tipo", ["Ação", "FII"])
+        w_price = w3.number_input("Preço atual (R$)", min_value=0.0, step=0.10)
+        w_ceiling = w4.number_input(
+            "Preço-teto (R$)", min_value=0.0, step=0.10,
+            help="Deixe 0 para usar o preço-teto da última análise salva desse ticker.",
+        )
+        w_note = st.text_input(
+            "Observação", placeholder="Ex.: esperar o resultado do 3T26; checar inadimplência"
+        )
+        w_submit = st.form_submit_button("Salvar na lista", use_container_width=True)
+
+    if w_submit:
+        ticker = w_ticker.upper().strip()
+        if not ticker:
+            st.error("Informe o ticker.")
+        else:
+            existing = get_watch(ticker)
+            ceiling = w_ceiling
+            if ceiling <= 0:
+                saved = {a["ticker"]: a for a in latest_analyses()}.get(ticker)
+                ceiling = saved["ceiling"] if saved else (existing["ceiling"] if existing else 0.0)
+            price = w_price if w_price > 0 else (existing["last_price"] if existing else 0.0)
+
+            if ceiling <= 0:
+                st.error(
+                    "Sem preço-teto: informe um valor ou calcule o ativo nas abas Ações/FIIs antes."
+                )
+            else:
+                upsert_watch(ticker, w_type, ceiling, price, w_note)
+                st.success(f"{ticker} salvo na lista.")
+
+    if st.button("Importar tickers do histórico de análises"):
+        count = import_watch_from_history()
+        st.success(f"{count} ativo(s) importado(s) ou atualizado(s) a partir do histórico.")
+
+    watch_rows = load_watchlist()
+
+    if not watch_rows:
+        st.info("A lista está vazia. Adicione um ativo acima ou importe do histórico.")
+    else:
+        # Quem tem mais folga até o teto aparece primeiro; sem preço vai para o fim
+        watch_rows.sort(
+            key=lambda r: (watch_distance(r) is None, -(watch_distance(r) or 0.0))
+        )
+
+        in_zone = sum(1 for r in watch_rows if 0 < r["last_price"] <= r["ceiling"])
+        k1, k2 = st.columns(2)
+        k1.metric("Ativos na lista", len(watch_rows))
+        k2.metric("Dentro do preço-teto", in_zone)
+
+        st.dataframe(
+            [
+                {
+                    "Ticker": r["ticker"],
+                    "Tipo": r["asset_type"],
+                    "Preço atual": brl(r["last_price"]) if r["last_price"] > 0 else "—",
+                    "Preço-teto": brl(r["ceiling"]),
+                    "Distância até o teto": (
+                        pct(watch_distance(r) * 100) if watch_distance(r) is not None else "—"
+                    ),
+                    "Situação": watch_status(r["last_price"], r["ceiling"]),
+                    "Revisar?": "⚠️ dados antigos" if days_since(r["updated_at"]) > 90 else "",
+                    "Observação": r["note"],
+                    "Atualizado em": r["updated_at"],
+                }
+                for r in watch_rows
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("Remover ativo da lista"):
+            to_remove = st.selectbox("Ticker", [r["ticker"] for r in watch_rows])
+            if st.button("Remover da lista"):
+                delete_watch(to_remove)
+                st.rerun()
 
 # ---------------------------------------------------------------------
 # HISTÓRICO
