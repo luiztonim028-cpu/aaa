@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import math
 import sqlite3
 import statistics
 from datetime import datetime
@@ -220,18 +221,348 @@ def consolidate(methods, criterion_key):
     return statistics.median(values)
 
 
-def discounted_cash_flow(base_flow, growth, rate, terminal_growth, years):
-    """Valor presente de fluxos crescentes + valor terminal (Gordon).
-    Retorna (valor_justo, fração do valor que vem da perpetuidade)."""
-    present_value, flow = 0.0, base_flow
-    for year in range(1, years + 1):
-        flow *= 1 + growth
-        present_value += flow / ((1 + rate) ** year)
+RISK_FREE_DEFAULT = 13.75  # Selic em 16/09/2026. Atualize quando mudar (ou use a NTN-B longa).
 
-    terminal_value = flow * (1 + terminal_growth) / (rate - terminal_growth)
-    discounted_terminal = terminal_value / ((1 + rate) ** years)
-    fair_value = present_value + discounted_terminal
-    return fair_value, discounted_terminal / fair_value
+BAZIN_YIELDS = [6.0, 7.0, 8.0, 9.0, 10.0]
+
+# Pontos de partida por setor (heurísticas editáveis, não regras).
+# yield: yield mínimo do Bazin | g1: crescimento inicial do lucro (% a.a.)
+# premium: prêmio de risco (p.p.) somado à taxa livre de risco | margin: margem de segurança (%)
+SECTOR_PRESETS = {
+    "Bancos": {
+        "yield": 8.0, "g1": 6.0, "premium": 1.0, "margin": 15.0,
+        "note": "Lucro sensível a crédito e inadimplência: use o lucro líquido ajustado e confira ROE e P/VP. "
+                "Parte do lucro fica retida para sustentar o crescimento da carteira.",
+    },
+    "Seguros": {
+        "yield": 7.5, "g1": 5.0, "premium": 0.5, "margin": 15.0,
+        "note": "Lucro mais estável e payout alto. O resultado financeiro depende da Selic.",
+    },
+    "Energia elétrica": {
+        "yield": 7.0, "g1": 5.0, "premium": 0.5, "margin": 15.0,
+        "note": "Receita regulada e indexada à inflação. Observe alavancagem e revisões tarifárias.",
+    },
+    "Saneamento": {
+        "yield": 7.0, "g1": 5.0, "premium": 0.5, "margin": 15.0,
+        "note": "Receita regulada, investimento alto (que reduz o fluxo ao acionista) e risco político.",
+    },
+    "Petróleo e commodities": {
+        "yield": 9.0, "g1": 3.0, "premium": 2.5, "margin": 25.0,
+        "note": "Lucro oscila com preço e câmbio: compare o lucro projetivo com a média do histórico "
+                "(lucro normalizado) e use margem maior.",
+    },
+    "Construção e imobiliário": {
+        "yield": 9.0, "g1": 5.0, "premium": 2.5, "margin": 25.0,
+        "note": "Cíclico e sensível a juros. Observe caixa, alavancagem e distratos.",
+    },
+    "Varejo e consumo": {
+        "yield": 9.0, "g1": 5.0, "premium": 2.5, "margin": 25.0,
+        "note": "Margens pressionadas por juros altos e pelo endividamento do consumidor.",
+    },
+    "Tecnologia e indústria": {
+        "yield": 8.0, "g1": 7.0, "premium": 2.0, "margin": 20.0,
+        "note": "Crescimento maior e payout menor: o yield do Bazin pesa menos, dê mais peso ao fluxo descontado.",
+    },
+    "Infraestrutura e transporte": {
+        "yield": 8.0, "g1": 5.0, "premium": 1.5, "margin": 20.0,
+        "note": "Concessões têm fluxo previsível, mas costumam ser alavancadas.",
+    },
+    "Outro / personalizado": {
+        "yield": 8.0, "g1": 5.0, "premium": 1.5, "margin": 20.0,
+        "note": "Ajuste todas as premissas manualmente.",
+    },
+}
+
+FLOW_MODES = {
+    "FCFE: lucro × (1 − g ÷ ROE) (Damodaran)": "fcfe",
+    "Dividendos: lucro × payout": "div",
+    "Lucro integral (referência otimista, como no print)": "earnings",
+}
+
+FLOW_TITLES = {
+    "fcfe": "FCD Damodaran (FCFE)",
+    "div": "DDM projetado (lucro × payout)",
+    "earnings": "FCD sobre lucro integral (referência)",
+}
+
+
+def thousands(value, decimals=1):
+    return f"{value:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def parse_number(token):
+    token = token.strip().replace(" ", "")
+    if "," in token:
+        token = token.replace(".", "").replace(",", ".")
+    return float(token)
+
+
+def parse_series(text, max_len=15):
+    """'1177,6; 1151,5; 1503,4' -> [1177.6, 1151.5, 1503.4]. Levanta ValueError se inválido."""
+    parts = [p for p in (x.strip() for x in text.split(";")) if p]
+    if len(parts) > max_len:
+        raise ValueError(f"Informe no máximo {max_len} valores.")
+    values = []
+    for part in parts:
+        try:
+            value = parse_number(part)
+        except ValueError:
+            raise ValueError(
+                f"valor inválido '{part}'. Use vírgula como decimal e ';' entre os anos."
+            )
+        if not math.isfinite(value):
+            raise ValueError(f"valor inválido '{part}'.")
+        values.append(value)
+    return values
+
+
+def history_table(values, window, last_year):
+    """Últimos `window` anos do histórico, com crescimento ano a ano, CAGR e média da janela."""
+    n = len(values)
+    start = max(0, n - window)
+    rows = []
+    for i in range(start, n):
+        growth = values[i] / values[i - 1] - 1 if i > 0 and values[i - 1] > 0 else None
+        rows.append({"year": last_year - (n - 1 - i), "earnings": values[i], "growth": growth})
+    window_values = values[start:]
+    cagr = None
+    if len(window_values) >= 2 and window_values[0] > 0 and window_values[-1] > 0:
+        cagr = (window_values[-1] / window_values[0]) ** (1 / (len(window_values) - 1)) - 1
+    average = statistics.mean(window_values) if window_values else None
+    return rows, cagr, average
+
+
+def project_dcf(base_earnings, g1, decay, terminal_growth, years, rate, flow_mode,
+                payout=0.0, roe=0.0, terminal_roe=None, fraction=1.0):
+    """Projeta os lucros (R$ milhões) e desconta o fluxo ao acionista (todas as taxas em fração).
+
+    O ano 1 é o ano corrente, com `base_earnings` (lucro projetivo). A partir do ano 2 o
+    crescimento começa em `g1` e converge para `terminal_growth`, `decay` por ano.
+
+    Fluxos:
+      fcfe     -> lucro × (1 − g_próximo ÷ ROE): o que sobra depois de reinvestir para crescer
+      div      -> lucro × payout
+      earnings -> lucro integral (supõe que crescer não custa nada; só como referência)
+    """
+    notes = []
+    growths, earnings, g = [None], [base_earnings], g1
+    for _ in range(2, years + 1):
+        growths.append(g)
+        earnings.append(earnings[-1] * (1 + g))
+        if g > terminal_growth:
+            g = max(g - decay, terminal_growth)
+        else:
+            g = min(g + decay, terminal_growth)
+
+    terminal_roe = terminal_roe if terminal_roe else rate
+
+    def ratio_for(next_growth, terminal=False):
+        if flow_mode == "fcfe":
+            return 1 - next_growth / (terminal_roe if terminal else roe)
+        if flow_mode == "div":
+            return payout
+        return 1.0
+
+    rows, pv_total, clipped = [], 0.0, False
+    for k, earn in enumerate(earnings):
+        next_g = growths[k + 1] if k + 1 < years else terminal_growth
+        ratio = ratio_for(next_g)
+        if ratio < 0:
+            clipped, ratio = True, 0.0
+        flow = earn * ratio * (fraction if k == 0 else 1.0)
+        pv = flow / (1 + rate) ** (fraction + k)
+        pv_total += pv
+        rows.append({"k": k, "earnings": earn, "growth": growths[k],
+                     "ratio": ratio, "flow": flow, "pv": pv})
+
+    terminal_ratio = ratio_for(terminal_growth, terminal=True)
+    if terminal_ratio < 0:
+        clipped, terminal_ratio = True, 0.0
+    terminal_flow = earnings[-1] * (1 + terminal_growth) * terminal_ratio
+    terminal_value = terminal_flow / (rate - terminal_growth)
+    pv_terminal = terminal_value / (1 + rate) ** (fraction + years - 1)
+    value = pv_total + pv_terminal
+
+    if clipped:
+        notes.append(
+            "Em algum ano o crescimento exige reinvestir mais do que o ROE gera (fluxo negativo). "
+            "O fluxo foi limitado a zero; revise o crescimento ou o ROE."
+        )
+    return {
+        "value": value, "pv_terminal": pv_terminal,
+        "terminal_share": pv_terminal / value if value > 0 else 0.0,
+        "terminal_ratio": terminal_ratio, "rows": rows, "notes": notes,
+    }
+
+
+def analyze_stock(p):
+    """Calcula todos os métodos de ações a partir de um dicionário de entradas."""
+    methods, notes = [], []
+    r, gt = p["rate"] / 100, p["terminal_growth"] / 100
+    rate_ok = r > gt
+    margin, apply_all = p["margin"], p["apply_all"]
+    shares, payout, roe = p["shares_mi"], p["payout"], p["roe"]
+    y = p["bazin_yield"]
+
+    # Lucro projetivo do ano: informado, ou 1º semestre × (2 + variação do 2º semestre)
+    if p["profit_override"] > 0:
+        profit = p["profit_override"]
+    elif p["profit_1s"] > 0:
+        profit = p["profit_1s"] * (2 + p["adj_2s"] / 100)
+    else:
+        profit = 0.0
+
+    lpa_proj = profit / shares if profit > 0 and shares > 0 else 0.0
+    dpa_proj = lpa_proj * payout / 100
+    dpa_values = [d for d in p["dpa"] if d > 0]
+    dpa_avg = statistics.mean(dpa_values) if dpa_values else 0.0
+
+    # 1. Bazin com média de proventos
+    if dpa_avg > 0:
+        methods.append(make_method(
+            "Bazin: DPA médio de 3 anos",
+            dpa_avg / (y / 100),
+            f"Média de {len(dpa_values)} ano(s) de proventos (R$ {num(dpa_avg)}) ÷ yield mínimo de {y:.1f}%.",
+            margin, apply_all,
+        ))
+
+    # 2. Bazin projetivo
+    if dpa_proj > 0:
+        methods.append(make_method(
+            "Bazin projetivo",
+            dpa_proj / (y / 100),
+            f"DPA projetado de R$ {num(dpa_proj)} (lucro projetivo × payout ÷ ações) ÷ yield mínimo de {y:.1f}%.",
+            margin, apply_all,
+        ))
+    elif profit > 0:
+        notes.append("Bazin projetivo ignorado: informe o payout e o nº de ações.")
+
+    # 3. Número de Graham (LPA informado ou LPA projetivo)
+    eps = p["eps_graham"] if p["eps_graham"] > 0 else lpa_proj
+    bvps = p["bvps"]
+    if eps > 0 and bvps > 0:
+        methods.append(make_method(
+            "Número de Graham",
+            (p["max_pl"] * p["max_pvp"] * eps * bvps) ** 0.5,
+            f"Respeita P/L ≤ {p['max_pl']:.1f} e P/VP ≤ {p['max_pvp']:.1f} "
+            f"(constante {p['max_pl'] * p['max_pvp']:.1f}), com LPA de R$ {num(eps)}.",
+            margin, apply_all,
+        ))
+    elif p["eps_graham"] > 0 or bvps > 0:
+        notes.append("Graham ignorado: informe LPA e VPA, ambos positivos.")
+
+    # 4. P/VP justo pelo ROE
+    if roe > 0 and bvps > 0 and rate_ok:
+        fair_pvp = justified_pvp(roe / 100, r, gt)
+        if fair_pvp is None:
+            notes.append("P/VP justo ignorado: o ROE precisa ser maior que o crescimento na perpetuidade.")
+        else:
+            methods.append(make_method(
+                "P/VP justo pelo ROE",
+                bvps * fair_pvp,
+                f"P/VP justo = (ROE {roe:.1f}% − {gt * 100:.1f}%) ÷ ({r * 100:.1f}% − {gt * 100:.1f}%) "
+                f"= {num(fair_pvp)}x.",
+                margin, True,
+            ))
+    elif roe > 0 and bvps > 0 and not rate_ok:
+        notes.append("P/VP justo ignorado: a taxa de desconto precisa ser maior que o crescimento na perpetuidade.")
+
+    # 5. Fluxo de caixa descontado (Damodaran)
+    hist_values, hist_rows, cagr, hist_avg = [], [], None, None
+    if p["hist_text"].strip():
+        try:
+            hist_values = parse_series(p["hist_text"])
+        except ValueError as err:
+            notes.append(f"Histórico de lucros ignorado: {err}")
+    if hist_values:
+        hist_rows, cagr, hist_avg = history_table(hist_values, p["hist_window"], p["current_year"] - 1)
+        if len(hist_values) < p["hist_window"]:
+            notes.append(
+                f"Você informou {len(hist_values)} ano(s) de lucro; a janela de "
+                f"{p['hist_window']} anos usa só esses."
+            )
+
+    report, flow_key = None, p["flow_key"]
+    if profit <= 0:
+        if p["hist_text"].strip():
+            notes.append("Fluxo descontado ignorado: informe o lucro do 1º semestre ou o lucro projetado do ano.")
+    elif shares <= 0:
+        notes.append("Fluxo descontado ignorado: informe o nº de ações (em milhões).")
+    elif not rate_ok:
+        notes.append("Fluxo descontado ignorado: a taxa de desconto precisa ser maior que o crescimento na perpetuidade.")
+    elif flow_key == "fcfe" and roe <= 0:
+        notes.append("FCFE precisa do ROE: informe o ROE ou escolha o fluxo de dividendos.")
+    elif flow_key == "div" and payout <= 0:
+        notes.append("Fluxo de dividendos precisa do payout: informe o payout.")
+    else:
+        g1, decay, years = p["g1"] / 100, p["decay"] / 100, int(p["years"])
+        fraction = p["fraction"] / 100
+        terminal_roe = p["terminal_roe"] / 100 if p["terminal_roe"] > 0 else None
+
+        def run(g1_value, rate_value):
+            return project_dcf(profit, g1_value, decay, gt, years, rate_value, flow_key,
+                               payout / 100, roe / 100,
+                               terminal_roe if terminal_roe else rate_value, fraction)
+
+        result = run(g1, r)
+        fair_ps = result["value"] / shares
+        methods.append(make_method(
+            FLOW_TITLES[flow_key],
+            fair_ps,
+            f"Taxa de desconto {r * 100:.1f}%; crescimento inicial {g1 * 100:.1f}% caindo "
+            f"{decay * 100:.1f} p.p./ano até {gt * 100:.1f}%; {years} anos. "
+            f"Equivale a {num(result['value'] / profit)}x o lucro projetivo (antes da margem).",
+            margin, True,
+        ))
+        notes.extend(result["notes"])
+
+        if flow_key == "earnings":
+            notes.append(
+                "Fluxo sobre o lucro integral supõe que 100% do lucro chega ao acionista todo ano e que "
+                "crescer não custa nada. Tende a superestimar o valor; use como referência, não como teto."
+            )
+        if result["terminal_share"] > 0.75:
+            notes.append(
+                f"{result['terminal_share']:.0%} do valor vem da perpetuidade. O resultado é muito sensível "
+                "às premissas; considere mais anos de projeção ou revisar as taxas."
+            )
+        if p["terminal_growth"] > 5:
+            notes.append("Crescimento na perpetuidade acima de 5% é agressivo.")
+        if cagr is not None and g1 > cagr + 0.02:
+            notes.append(
+                f"O crescimento inicial ({g1 * 100:.1f}%) está acima do CAGR histórico da janela "
+                f"({cagr * 100:.1f}%). Confirme se há motivo para acelerar."
+            )
+        g_sust = roe / 100 * (1 - payout / 100) if roe > 0 and payout > 0 else None
+        if g_sust is not None and g1 > g_sust + 0.005:
+            notes.append(
+                f"O crescimento inicial ({g1 * 100:.1f}%) está acima do crescimento sustentável "
+                f"ROE × (1 − payout) = {g_sust * 100:.1f}%. Para crescer isso, a empresa precisaria "
+                "elevar o ROE ou reter mais lucro."
+            )
+
+        scenarios = []
+        for name, dg, dr in (("Pessimista", -2.0, 1.0), ("Base", 0.0, 0.0), ("Otimista", 2.0, -1.0)):
+            r_s, g_s = r + dr / 100, g1 + dg / 100
+            if r_s <= gt:
+                continue
+            ps = run(g_s, r_s)["value"] / shares
+            scenarios.append({"name": name, "g1": g_s, "rate": r_s, "fair": ps,
+                              "ceiling": ps * (1 - margin / 100)})
+
+        report = {
+            "title": FLOW_TITLES[flow_key], "result": result, "shares": shares, "profit": profit,
+            "fair_ps": fair_ps, "history": hist_rows, "cagr": cagr, "hist_avg": hist_avg,
+            "last_closed": hist_values[-1] if hist_values else None, "window": p["hist_window"],
+            "scenarios": scenarios, "base_year": p["current_year"], "g_sust": g_sust,
+            "premises": {"rate": r, "g1": g1, "decay": decay, "gt": gt, "years": years,
+                         "payout": payout / 100, "roe": roe / 100},
+        }
+
+    return {
+        "methods": methods, "notes": notes, "report": report, "profit": profit,
+        "lpa_proj": lpa_proj, "dpa_proj": dpa_proj, "dpa_avg": dpa_avg, "eps": eps,
+    }
 
 
 def justified_pvp(roe, rate, growth):
@@ -354,6 +685,126 @@ def show_results(asset_type, ticker, market_price, margin, methods,
     st.info("💾 Análise salva no histórico.")
 
 
+def render_dcf_report(rep, market_price):
+    """Mostra a 'realidade projetada': histórico, projeção ano a ano, valor e cenários."""
+    res, shares, pr = rep["result"], rep["shares"], rep["premises"]
+    fair_ps = rep["fair_ps"]
+
+    st.markdown("### Realidade projetada: fluxo de caixa descontado")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Market cap atual (R$ mi)", thousands(market_price * shares))
+    c2.metric("Valor do patrimônio no FCD (R$ mi)", thousands(res["value"]))
+    c3.metric("Preço justo por ação", brl(fair_ps))
+    c4.metric("Upside / Downside", pct((fair_ps / market_price - 1) * 100))
+
+    premises = (
+        f"{rep['title']} · taxa de desconto {pct(pr['rate'] * 100)} · crescimento inicial "
+        f"{pct(pr['g1'] * 100)} caindo {num(pr['decay'] * 100, 1)} p.p./ano até {pct(pr['gt'] * 100)} · "
+        f"{pr['years']} anos"
+    )
+    if pr["roe"] > 0:
+        premises += f" · ROE {pct(pr['roe'] * 100)}"
+    if pr["payout"] > 0:
+        premises += f" · payout {pct(pr['payout'] * 100)}"
+    if rep["g_sust"] is not None:
+        premises += f" · crescimento sustentável ROE × (1 − payout) = {pct(rep['g_sust'] * 100)}"
+    st.caption(premises)
+
+    if rep["last_closed"]:
+        change = rep["profit"] / rep["last_closed"] - 1
+        st.caption(
+            f"Lucro projetivo do ano vs. último ano fechado: {pct(change * 100)}."
+            + (f" CAGR do histórico ({rep['window']} anos): {pct(rep['cagr'] * 100)}." if rep["cagr"] is not None else "")
+            + (f" Média do lucro na janela (lucro normalizado): R$ {thousands(rep['hist_avg'])} mi."
+               if rep["hist_avg"] is not None else "")
+        )
+
+    rows = []
+    for h in rep["history"]:
+        rows.append({
+            "Ano": f"{h['year']} (realizado)",
+            "Lucro líquido (R$ mi)": thousands(h["earnings"]),
+            "Crescimento": pct(h["growth"] * 100) if h["growth"] is not None else "—",
+            "Fluxo ao acionista (R$ mi)": "—", "% do lucro": "—", "Valor presente (R$ mi)": "—",
+        })
+    for row in res["rows"]:
+        year = rep["base_year"] + row["k"]
+        rows.append({
+            "Ano": f"{year} (projetado)",
+            "Lucro líquido (R$ mi)": thousands(row["earnings"]),
+            "Crescimento": pct(row["growth"] * 100) if row["growth"] is not None else "projetivo",
+            "Fluxo ao acionista (R$ mi)": thousands(row["flow"]),
+            "% do lucro": pct(row["ratio"] * 100),
+            "Valor presente (R$ mi)": thousands(row["pv"]),
+        })
+    rows.append({
+        "Ano": "Perpetuidade", "Lucro líquido (R$ mi)": "—",
+        "Crescimento": pct(pr["gt"] * 100), "Fluxo ao acionista (R$ mi)": "—",
+        "% do lucro": pct(res["terminal_ratio"] * 100),
+        "Valor presente (R$ mi)": thousands(res["pv_terminal"]),
+    })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    if rep["scenarios"]:
+        st.markdown("**Cenários** (crescimento inicial ±2 p.p. e taxa de desconto ∓1 p.p.)")
+        st.dataframe(
+            [
+                {
+                    "Cenário": s["name"],
+                    "Crescimento inicial": pct(s["g1"] * 100),
+                    "Taxa de desconto": pct(s["rate"] * 100),
+                    "Preço justo": brl(s["fair"]),
+                    "Preço-teto (com margem)": brl(s["ceiling"]),
+                    "Distância até o teto": pct((s["ceiling"] / market_price - 1) * 100),
+                }
+                for s in rep["scenarios"]
+            ],
+            use_container_width=True, hide_index=True,
+        )
+
+
+def render_bazin_tables(dpa_avg, dpa_proj, chosen_yield, price):
+    """Preço-teto do Bazin para yields de 6% a 10% (e o escolhido), histórico e projetivo."""
+    if dpa_avg <= 0 and dpa_proj <= 0:
+        return
+    st.markdown("### Bazin: preço-teto por yield mínimo")
+    chosen = round(chosen_yield, 2)
+    rows = []
+    for y in sorted(set(BAZIN_YIELDS + [chosen])):
+        row = {"Yield mínimo": pct(y) + (" ← escolhido" if abs(y - chosen) < 1e-9 else "")}
+        for label, dpa in (("3 anos", dpa_avg), ("projetivo", dpa_proj)):
+            if dpa > 0:
+                ceiling = dpa / (y / 100)
+                row[f"Teto: Bazin {label}"] = brl(ceiling)
+                row[f"Distância ({label})"] = f"{'🟢' if price <= ceiling else '🔴'} {pct((ceiling / price - 1) * 100)}"
+        rows.append(row)
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.caption(
+        "Quanto maior o yield exigido, menor o preço-teto. 🟢 = preço atual dentro do teto; "
+        "distância = teto ÷ preço atual − 1."
+    )
+
+
+def render_tracking_row(ticker, price, dy_pct, lpa, dpa, payout, shares_mi, profit, ceiling_proj):
+    """Linha no formato da planilha de acompanhamento."""
+    st.markdown("### Planilha de acompanhamento")
+    st.dataframe(
+        [{
+            "Ação": ticker.upper().strip(),
+            "Cotação atual": brl(price),
+            "DY (12M)": pct(dy_pct) if dy_pct > 0 else "—",
+            "LPA": brl(lpa),
+            "DPA": brl(dpa),
+            "Payout": pct(payout),
+            "Nº de papéis (mi)": thousands(shares_mi),
+            "Lucro projetivo (R$ mi)": thousands(profit),
+            "Preço-teto projetivo": brl(ceiling_proj),
+        }],
+        use_container_width=True, hide_index=True,
+    )
+    st.caption("DPA = LPA projetivo × payout. Preço-teto projetivo = DPA ÷ yield mínimo escolhido.")
+
+
 # ---------------------------------------------------------------------
 # APP
 # ---------------------------------------------------------------------
@@ -376,10 +827,22 @@ tab_stock, tab_fii, tab_watch, tab_history = st.tabs(
 with tab_stock:
     st.subheader("Valuation de Ações")
     st.caption(
-        "Deixe em zero os dados dos métodos que não se aplicam à empresa. "
-        "Use sempre dados de longo prazo (média de 5 anos para dividendos e lucros) "
-        "para evitar distorções de um ano atípico."
+        "Deixe em zero os dados dos métodos que não quiser calcular. Valores totais da empresa "
+        "(lucro, nº de ações) em milhões de reais / milhões de ações. Os resultados ficam abaixo do formulário."
     )
+
+    sector = st.selectbox(
+        "Setor (preenche sugestões iniciais; tudo pode ser editado)", list(SECTOR_PRESETS.keys())
+    )
+    preset = SECTOR_PRESETS[sector]
+    default_rate = round(RISK_FREE_DEFAULT + preset["premium"], 2)
+    st.info(
+        f"**{sector}:** {preset['note']}  \n"
+        f"Sugestões: yield mínimo {pct(preset['yield'])}, crescimento inicial {pct(preset['g1'])} ao ano, "
+        f"taxa de desconto {pct(default_rate)} (taxa livre de risco {pct(RISK_FREE_DEFAULT)} + prêmio de "
+        f"{num(preset['premium'], 1)} p.p.) e margem de segurança de {pct(preset['margin'])}."
+    )
+    key = sector.replace(" ", "_")  # as sugestões recarregam quando o setor muda
 
     with st.form("stock_form"):
         col1, col2, col3 = st.columns(3)
@@ -388,77 +851,118 @@ with tab_stock:
             st.markdown("**Dados de mercado**")
             stock_ticker = st.text_input("Ticker (ex: BBAS3)")
             stock_price = st.number_input("Preço atual (R$)", min_value=0.0, step=0.10)
+            shares_mi = st.number_input(
+                "Nº de ações (milhões)", min_value=0.0, step=1.0,
+                help="Total de ações em circulação (sem tesouraria). Use o mesmo número em todos os métodos.",
+            )
+            dy_site = st.number_input(
+                "Dividend Yield 12M do site (%) — opcional", min_value=0.0, step=0.1,
+                help="Só para a planilha de acompanhamento. Com 0, o app usa o DPA do último ano ÷ preço.",
+            )
+            payout = st.number_input(
+                "Payout (%)", min_value=0.0, max_value=100.0, step=1.0,
+                help="Parcela do lucro distribuída. DPA = LPA × payout.",
+            )
+            roe = st.number_input(
+                "ROE (%)", min_value=0.0, step=0.5,
+                help="Sustentável (média de 3 a 5 anos). Define o crescimento sustentável, "
+                     "ROE × (1 − payout), e o reinvestimento do método FCFE.",
+            )
+
+            st.markdown("**Lucro projetivo do ano (R$ milhões)**")
+            st.caption(
+                "Pegue o lucro líquido ajustado do 1º semestre e projete o 2º com base no "
+                "comportamento dos anos anteriores. Lucro do ano = 1º sem. × (2 + variação)."
+            )
+            profit_1s = st.number_input("Lucro líquido ajustado do 1º semestre (R$ mi)", min_value=0.0, step=10.0)
+            adj_2s = st.number_input(
+                "Variação esperada do 2º semestre vs. 1º (%)", min_value=-100.0, value=0.0, step=1.0,
+            )
+            profit_override = st.number_input(
+                "Ou informe o lucro projetado do ano (R$ mi)", min_value=0.0, step=10.0,
+                help="Se maior que zero, substitui o cálculo pelo semestre.",
+            )
+
+            st.markdown("**Margem e consolidação**")
             stock_margin = st.number_input(
-                "Margem de segurança (%)", min_value=0.0, max_value=99.0, value=15.0, step=1.0,
-                help="Aplicada ao Fluxo Descontado e ao P/VP justo, que são estimativas "
-                     "sujeitas a erro de premissa.",
+                "Margem de segurança (%)", min_value=0.0, max_value=99.0,
+                value=preset["margin"], step=1.0, key=f"margin_{key}",
+                help="Aplicada ao fluxo descontado e ao P/VP justo, que são estimativas.",
             )
             apply_all = st.checkbox(
-                "Aplicar a margem também a Bazin e Graham",
-                value=False,
-                help="Bazin e Graham já resultam em preços-teto conservadores por construção. "
-                     "Marque apenas se quiser ser ainda mais rigoroso.",
+                "Aplicar a margem também a Bazin e Graham", value=False,
+                help="Bazin e Graham já resultam em tetos conservadores por construção.",
             )
             stock_criterion = st.selectbox("Como consolidar os métodos", list(CRITERIA.keys()))
 
-            st.markdown("**Referência histórica da empresa (opcional)**")
-            st.caption("Do histórico de indicadores do site, sem anos atípicos. Deixe 0 para ignorar.")
-            h_pl_avg = st.number_input("P/L médio histórico", min_value=0.0, step=0.5)
-            h_pl_max = st.number_input("P/L máximo histórico", min_value=0.0, step=0.5)
-            h_pvp_avg = st.number_input("P/VP médio histórico", min_value=0.0, step=0.05)
-            h_pvp_max = st.number_input("P/VP máximo histórico", min_value=0.0, step=0.05)
-            h_dy_avg = st.number_input("Yield médio histórico (%)", min_value=0.0, step=0.5)
-
         with col2:
-            st.markdown("**Décio Bazin (Dividendos)**")
-            dpa = st.number_input(
-                "DPA médio anual (R$)", min_value=0.0, step=0.10,
-                help="Ideal: média dos dividendos por ação dos últimos 5 anos, em reais.",
-            )
+            st.markdown("**Décio Bazin (3 anos de proventos)**")
+            dpa_1 = st.number_input("DPA do último ano (R$/ação)", min_value=0.0, step=0.10)
+            dpa_2 = st.number_input("DPA do penúltimo ano (R$/ação)", min_value=0.0, step=0.10)
+            dpa_3 = st.number_input("DPA do antepenúltimo ano (R$/ação)", min_value=0.0, step=0.10)
             bazin_yield = st.number_input(
-                "Yield mínimo exigido (%)", min_value=0.1, value=6.0, step=0.5,
-                help="Bazin usa 6%. Para ser coerente com o fluxo descontado, o yield mínimo "
-                     "deve ser parecido com o yield que o fluxo descontado equivale (aparece na "
-                     "coluna Premissa do resultado).",
+                "Yield mínimo exigido (%)", min_value=1.0, value=preset["yield"], step=0.5,
+                key=f"yield_{key}",
+                help="O mínimo clássico é 6%. A tabela dos resultados mostra o teto de 6% a 10%. "
+                     "Para ser coerente com o fluxo descontado, o yield deve ser parecido com a "
+                     "taxa de desconto menos o crescimento de longo prazo.",
             )
 
-            st.markdown("**Número de Graham**")
-            eps = st.number_input(
-                "LPA — Lucro por ação (R$)", min_value=0.0, step=0.10,
-                help="Ideal: média dos últimos 3 a 5 anos (suaviza ciclos).",
-            )
-            bvps = st.number_input("VPA — Valor patrimonial por ação (R$)", min_value=0.0, step=0.10)
-            max_pl = st.number_input("P/L máximo", min_value=0.1, value=15.0, step=0.5)
-            max_pvp = st.number_input("P/VP máximo", min_value=0.1, value=1.5, step=0.1)
+            with st.expander("Outros métodos: Graham e P/VP justo"):
+                eps_graham = st.number_input(
+                    "LPA (R$/ação) — 0 usa o LPA projetivo", min_value=0.0, step=0.10,
+                    help="Ideal: média de 3 a 5 anos.",
+                )
+                bvps = st.number_input("VPA — Valor patrimonial por ação (R$)", min_value=0.0, step=0.10)
+                max_pl = st.number_input("P/L máximo (Graham)", min_value=0.1, value=15.0, step=0.5)
+                max_pvp = st.number_input("P/VP máximo (Graham)", min_value=0.1, value=1.5, step=0.1)
+                st.caption("O P/VP justo pelo ROE usa o ROE, o VPA, a taxa de desconto e a perpetuidade.")
 
-            st.markdown("**P/VP justo pelo ROE (ideal para bancos)**")
-            roe = st.number_input(
-                "ROE sustentável (%)", min_value=0.0, step=0.5,
-                help="Média de 3 a 5 anos. Usa a taxa de desconto e o crescimento na perpetuidade "
-                     "do bloco ao lado. Deixe 0 para ignorar.",
-            )
+            with st.expander("Teste de sanidade: múltiplos históricos (opcional)"):
+                h_pl_avg = st.number_input("P/L médio histórico", min_value=0.0, step=0.5)
+                h_pl_max = st.number_input("P/L máximo histórico", min_value=0.0, step=0.5)
+                h_pvp_avg = st.number_input("P/VP médio histórico", min_value=0.0, step=0.05)
+                h_pvp_max = st.number_input("P/VP máximo histórico", min_value=0.0, step=0.05)
+                h_dy_avg = st.number_input("Yield médio histórico (%)", min_value=0.0, step=0.5)
 
         with col3:
-            st.markdown("**Fluxo de Caixa Descontado**")
-            flow_type = st.selectbox(
-                "Fluxo a descontar",
-                [
-                    "FCL por ação (empresas comuns)",
-                    "Dividendos por ação (bancos, seguradoras, elétricas)",
-                ],
-                help="Para bancos e seguradoras, o fluxo de caixa livre não é confiável; use dividendos.",
+            st.markdown("**Fluxo de Caixa Descontado (Damodaran)**")
+            hist_text = st.text_input(
+                "Lucro líquido dos últimos anos (R$ mi)",
+                placeholder="Ex.: 1177,6; 1151,5; 1503,4; 1545,3; 2079,6",
+                help="Do mais antigo ao mais recente, separados por ';'. Vírgula como decimal e sem ponto de "
+                     "milhar. Serve de referência (crescimento e CAGR) e não entra no valor: o passado já "
+                     "está no balanço e no preço.",
             )
-            base_flow = st.number_input("Fluxo atual por ação (R$/ano)", min_value=0.0, step=0.10)
-            growth = st.number_input("Crescimento anual do fluxo (%)", min_value=-50.0, value=5.0, step=0.5)
+            hist_window = st.selectbox("Janela do histórico (anos)", [3, 5, 7], index=1)
+            flow_label = st.selectbox("Fluxo a descontar", list(FLOW_MODES.keys()))
+            g1_pct = st.number_input(
+                "Crescimento inicial a partir do 2º ano (%)", min_value=-50.0,
+                value=preset["g1"], step=0.5, key=f"g1_{key}",
+            )
+            decay_pp = st.number_input(
+                "Redução do crescimento por ano (p.p.)", min_value=0.0, value=0.5, step=0.1,
+                help="O crescimento converge para o da perpetuidade, caindo esse valor a cada ano.",
+            )
+            years = st.select_slider("Anos de projeção (incluindo o ano corrente)", options=[3, 5, 7, 10], value=5)
             discount_rate = st.number_input(
-                "Taxa de desconto / retorno exigido (%)", min_value=0.1, value=12.0, step=0.5,
-                help="Referência: taxa livre de risco (ex.: NTN-B) + prêmio de risco da empresa.",
+                "Taxa de desconto (%)", min_value=0.1, value=default_rate, step=0.25, key=f"rate_{key}",
+                help="Taxa livre de risco (Selic ou NTN-B) + prêmio de risco do setor.",
             )
             terminal_growth = st.number_input(
                 "Crescimento na perpetuidade (%)", min_value=-10.0, value=3.0, step=0.5,
-                help="Deve ser conservador: no máximo próximo à inflação de longo prazo.",
+                help="No máximo próximo à inflação de longo prazo.",
             )
-            years = st.number_input("Anos de projeção", min_value=1, max_value=30, value=5, step=1)
+            terminal_roe = st.number_input(
+                "ROE na perpetuidade (%) — 0 = igual à taxa de desconto", min_value=0.0, step=0.5,
+                help="Usado só no FCFE. Igual à taxa de desconto significa que crescer não cria valor "
+                     "depois do período projetado (hipótese conservadora de Damodaran).",
+            )
+            fraction_pct = st.number_input(
+                "Fração do ano corrente que ainda gera fluxo (%)", min_value=1.0, max_value=100.0,
+                value=100.0, step=5.0,
+                help="Se parte dos dividendos do ano já foi paga, reduza. 100% = ano inteiro.",
+            )
 
         stock_submit = st.form_submit_button("Calcular Preço Teto", use_container_width=True)
 
@@ -466,92 +970,42 @@ with tab_stock:
         if not stock_ticker.strip() or stock_price <= 0:
             st.error("Informe um ticker e um preço atual maior que zero.")
         else:
-            methods, notes = [], []
-            r, g, gt = discount_rate / 100, growth / 100, terminal_growth / 100
-            rate_ok = r > gt
+            outcome = analyze_stock({
+                "price": stock_price, "shares_mi": shares_mi, "payout": payout, "roe": roe,
+                "profit_1s": profit_1s, "adj_2s": adj_2s, "profit_override": profit_override,
+                "dpa": [dpa_1, dpa_2, dpa_3], "bazin_yield": bazin_yield,
+                "eps_graham": eps_graham, "bvps": bvps, "max_pl": max_pl, "max_pvp": max_pvp,
+                "hist_text": hist_text, "hist_window": hist_window, "flow_key": FLOW_MODES[flow_label],
+                "g1": g1_pct, "decay": decay_pp, "years": years, "rate": discount_rate,
+                "terminal_growth": terminal_growth, "terminal_roe": terminal_roe,
+                "fraction": fraction_pct, "margin": stock_margin, "apply_all": apply_all,
+                "current_year": datetime.now().year,
+            })
 
-            # 1. Bazin: preço máximo para receber o yield mínimo exigido
-            if dpa > 0:
-                methods.append(make_method(
-                    "Décio Bazin (Dividendos)",
-                    dpa / (bazin_yield / 100),
-                    f"Paga no máximo o preço que rende {bazin_yield:.1f}% em dividendos.",
-                    stock_margin, apply_all,
-                ))
-
-            # 2. Número de Graham: limita P/L e P/VP ao mesmo tempo
-            if eps > 0 and bvps > 0:
-                methods.append(make_method(
-                    "Número de Graham",
-                    (max_pl * max_pvp * eps * bvps) ** 0.5,
-                    f"Respeita P/L ≤ {max_pl:.1f} e P/VP ≤ {max_pvp:.1f} "
-                    f"(constante {max_pl * max_pvp:.1f}).",
-                    stock_margin, apply_all,
-                ))
-            elif eps > 0 or bvps > 0:
-                notes.append("Graham ignorado: informe LPA e VPA, ambos positivos.")
-
-            # 3. Fluxo descontado (FCL ou dividendos)
-            if (base_flow > 0 or roe > 0) and not rate_ok:
-                notes.append(
-                    "Fluxo descontado e P/VP justo ignorados: a taxa de desconto precisa ser "
-                    "maior que o crescimento na perpetuidade."
-                )
-            if base_flow > 0 and rate_ok:
-                fair_value, terminal_share = discounted_cash_flow(base_flow, g, r, gt, int(years))
-                is_ddm = flow_type.startswith("Dividendos")
-                label = "DDM (Dividendos descontados)" if is_ddm else "FCD (Fluxo de Caixa Descontado)"
-                methods.append(make_method(
-                    label,
-                    fair_value,
-                    f"Fluxo cresce {growth:.1f}% a.a. por {int(years)} anos, depois "
-                    f"{terminal_growth:.1f}% na perpetuidade; desconto de {discount_rate:.1f}%. "
-                    f"Equivale a exigir yield de {pct(base_flow / fair_value * 100)} "
-                    f"sobre o fluxo atual (antes da margem).",
-                    stock_margin, True,
-                ))
-                if terminal_share > 0.75:
-                    notes.append(
-                        f"{terminal_share:.0%} do valor do fluxo descontado vem da perpetuidade. "
-                        "O resultado é muito sensível às premissas; considere aumentar os anos "
-                        "de projeção ou revisar as taxas."
-                    )
-                if terminal_growth > 5:
-                    notes.append("Crescimento na perpetuidade acima de 5% é agressivo.")
-
-            # 4. P/VP justo pelo ROE (principal método para bancos)
-            if roe > 0 and rate_ok:
-                if bvps <= 0:
-                    notes.append("P/VP justo ignorado: informe o VPA.")
-                else:
-                    fair_pvp = justified_pvp(roe / 100, r, gt)
-                    if fair_pvp is None:
-                        notes.append(
-                            "P/VP justo ignorado: o ROE precisa ser maior que o crescimento "
-                            "na perpetuidade."
-                        )
-                    else:
-                        methods.append(make_method(
-                            "P/VP justo pelo ROE",
-                            bvps * fair_pvp,
-                            f"P/VP justo = (ROE {roe:.1f}% − {terminal_growth:.1f}%) ÷ "
-                            f"({discount_rate:.1f}% − {terminal_growth:.1f}%) = {num(fair_pvp)}x.",
-                            stock_margin, True,
-                        ))
-
+            eps_used, dpa_ref = outcome["eps"], outcome["dpa_proj"] or outcome["dpa_avg"]
+            dy_shown = dy_site if dy_site > 0 else (dpa_1 / stock_price * 100 if dpa_1 > 0 else 0.0)
             indicators = [
-                ("P/L atual", num(stock_price / eps, 1) if eps > 0 else "—"),
+                ("P/L projetivo", num(stock_price / outcome["lpa_proj"], 1) if outcome["lpa_proj"] > 0 else "—"),
                 ("P/VP atual", num(stock_price / bvps) if bvps > 0 else "—"),
-                ("Yield s/ DPA informado", pct(dpa / stock_price * 100) if dpa > 0 else "—"),
+                ("Dividend Yield 12M", pct(dy_shown) if dy_shown > 0 else "—"),
             ]
             sanity = {
-                "eps": eps, "bvps": bvps, "dividend": dpa,
+                "eps": eps_used, "bvps": bvps, "dividend": dpa_ref,
                 "hist": {"pl_avg": h_pl_avg, "pl_max": h_pl_max, "pvp_avg": h_pvp_avg,
                          "pvp_max": h_pvp_max, "dy_avg": h_dy_avg},
             }
 
-            show_results("Ação", stock_ticker, stock_price, stock_margin, methods,
-                         stock_criterion, notes, indicators, sanity)
+            show_results("Ação", stock_ticker, stock_price, stock_margin, outcome["methods"],
+                         stock_criterion, outcome["notes"], indicators, sanity)
+
+            if outcome["report"]:
+                render_dcf_report(outcome["report"], stock_price)
+            render_bazin_tables(outcome["dpa_avg"], outcome["dpa_proj"], bazin_yield, stock_price)
+            if outcome["dpa_proj"] > 0:
+                render_tracking_row(
+                    stock_ticker, stock_price, dy_shown, outcome["lpa_proj"], outcome["dpa_proj"],
+                    payout, shares_mi, outcome["profit"], outcome["dpa_proj"] / (bazin_yield / 100),
+                )
 
 # ---------------------------------------------------------------------
 # FUNDOS IMOBILIÁRIOS
